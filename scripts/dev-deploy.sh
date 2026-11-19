@@ -7,6 +7,9 @@
 #   scripts/dev-deploy.sh PS4_IP --no-build   install the last build
 #   scripts/dev-deploy.sh PS4_IP --restore    put the release binary back
 #   scripts/dev-deploy.sh PS4_IP --perf on    turn the perf log on (off: off)
+#   scripts/dev-deploy.sh PS4_IP --count on   count Jaguar replacement runs (patch 0038; off: off)
+#   scripts/dev-deploy.sh PS4_IP --overlay    copy overlay/opt/ps5-on-ps4 (home screen, launcher)
+#   scripts/dev-deploy.sh PS4_IP --restore-overlay  put the release /opt/ps5-on-ps4 back
 #   scripts/dev-deploy.sh PS4_IP --log        copy ~/kytyps5.log to out/logs/
 #
 # Needs SSH login turned on in EmuFive (Settings). Run `ssh-copy-id ps5@PS4_IP`
@@ -22,7 +25,7 @@ log() { printf '\033[1;34m[*]\033[0m %s\n' "$*"; }
 ok()  { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[-]\033[0m %s\n' "$*" >&2; exit 1; }
 
-[ $# -ge 1 ] || die "usage: $0 PS4_IP [--no-build|--restore|--perf on|off|--log]"
+[ $# -ge 1 ] || die "usage: $0 PS4_IP [--no-build|--restore|--perf on|off|--count on|off|--overlay|--restore-overlay|--log]"
 PS4="$1"; shift
 TARGET="ps5@$PS4"
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
@@ -61,6 +64,31 @@ case "${1:-}" in
             off) remote "rm -f ~/.kytyps5/perf-log" && ok "Perf log off" ;;
             *)   die "--perf on or --perf off" ;;
         esac ;;
+    --count)
+        case "${2:-}" in
+            on)  remote "mkdir -p ~/.kytyps5 && touch ~/.kytyps5/dev-env &&
+                         sed -i '/^KYTY_JAGUAR_COUNT=/d' ~/.kytyps5/dev-env &&
+                         echo KYTY_JAGUAR_COUNT=1 >> ~/.kytyps5/dev-env" &&
+                 ok "Counting on (from the next game start; reports every 10 s in the log)" ;;
+            off) remote "[ ! -f ~/.kytyps5/dev-env ] || sed -i '/^KYTY_JAGUAR_COUNT=/d' ~/.kytyps5/dev-env" &&
+                 ok "Counting off" ;;
+            *)   die "--count on or --count off" ;;
+        esac ;;
+    --overlay)
+        log "Copying overlay/opt/ps5-on-ps4 to $PS4"
+        tar -C "$ROOT/overlay" --owner=0 --group=0 -czf - opt/ps5-on-ps4 |
+            ssh "${SSH_OPTS[@]}" "$TARGET" "cat > /tmp/ps5-overlay.tgz"
+        remote_sudo "set -e
+            [ -e /opt/ps5-on-ps4.release.tgz ] || sudo tar -C / -czf /opt/ps5-on-ps4.release.tgz opt/ps5-on-ps4
+            sudo tar -C / --no-same-owner -xzf /tmp/ps5-overlay.tgz
+            rm -f /tmp/ps5-overlay.tgz"
+        ok "Installed. Restart from the home screen (Power, Restart) for the home screen to use it" ;;
+    --restore-overlay)
+        remote_sudo "set -e
+            [ -e /opt/ps5-on-ps4.release.tgz ] || { echo 'no release copy saved'; exit 1; }
+            sudo rm -rf /opt/ps5-on-ps4
+            sudo tar -C / -xzf /opt/ps5-on-ps4.release.tgz"
+        ok "Release home screen and launcher restored (restart from the home screen)" ;;
     --log)
         mkdir -p "$ROOT/out/logs"
         out="$ROOT/out/logs/kytyps5-$(date +%Y%m%d-%H%M%S).log"
@@ -72,6 +100,11 @@ case "${1:-}" in
             log "FPS over $perf_lines samples (min / median / max):"
             grep -o 'Perf flips [0-9]*: [0-9.]* fps' "$out" | awk '{print $4}' | sort -n |
                 awk '{a[NR]=$1} END {printf "    %.1f / %.1f / %.1f\n", a[1], a[int((NR+1)/2)], a[NR]}'
+        fi
+        if grep -q '^Jaguar replacements' "$out"; then
+            log "Last Jaguar replacement report:"
+            awk '/^Jaguar replacements/ {block = ""; on = 1} on && (/^Jaguar replacements/ || /^ /) {block = block $0 "\n"; next}
+                 {on = 0} END {printf "%s", block}' "$out"
         fi ;;
     *)
         die "unknown option: $1" ;;
