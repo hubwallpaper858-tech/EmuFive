@@ -1,0 +1,184 @@
+From 97a11910b84994fb11f5a3514051df2108408281 Mon Sep 17 00:00:00 2001
+From: hubwallpaper858-tech <hubwallpaper858-tech@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:34:28 -0500
+Subject: [PATCH] loader: KYTY_JAGUAR_FAST_FMA, FMA as a multiply and an add on
+ the PS4's CPU
+
+The Jaguar replacement for a single-precision FMA converts to double
+precision so that the result matches a fused one: about 25 host
+instructions for a 256-bit FMA (26 for VFMADD231PS, 32 for VFNMADD231PS).
+With KYTY_JAGUAR_FAST_FMA=1, every FMA form is a multiply and then an add
+or subtract in its own precision:
+
+- 132 and 213 forms, whose destination is one of the factors and whose
+  addend is another register or memory: two instructions in place, no
+  scratch register and no stack (three for the negated forms).
+- Otherwise (231 forms, the addend in the destination register, and
+  VFMSUBADD): the product goes to a saved scratch register, 8 or 9
+  instructions.
+- Negated forms negate the product before the add, so -(a*b)+c and
+  -(a*b)-c are exact IEEE operations on the rounded product (signed
+  zeros as an unfused c - a*b).
+
+The product is rounded before the add. Checked with tools/jaguar-test
+against native FMA on 102 forms (896 instances, 71680 runs): 98.9% of the
+computed elements are bit-exact and 99.96% within 1 ulp, 1 element of
+156960 is further than 64 ulps (cancellation), and 50 are NaN where the
+fused result is an infinity (the unfused product overflowed and met an
+infinity of the other sign). Every other register, the flags, memory and
+the stack match exactly. The default (no variable) is unchanged.
+---
+ src/loader/jaguarCompat.cpp | 130 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 130 insertions(+)
+
+diff --git a/src/loader/jaguarCompat.cpp b/src/loader/jaguarCompat.cpp
+index c05ddd33..01a62229 100644
+--- a/src/loader/jaguarCompat.cpp
++++ b/src/loader/jaguarCompat.cpp
+@@ -759,6 +759,133 @@ bool GetFmaForm(ZydisMnemonic mnemonic, FmaForm* form) {
+ 	return false;
+ }
+ 
++// KYTY_JAGUAR_FAST_FMA=1: FMA as a multiply and then an add in the instruction's own precision,
++// without converting to double. The product is rounded before the add, so a result can differ
++// from a fused one in its last bits, and by more when the product and the addend nearly cancel.
++// NaN signs and payloads may differ too. Two or three instructions instead of about twenty-five.
++bool FastFma() {
++	static const bool fast = [] {
++		const char* value = std::getenv("KYTY_JAGUAR_FAST_FMA");
++		return value != nullptr && *value != 0 && *value != '0';
++	}();
++	return fast;
++}
++
++bool GenerateFmaFast(Emitter& e, const FmaForm& form, bool wide) {
++	struct Ops {
++		ZydisMnemonic mul, add, sub, addsub, blend, xor_, move;
++	};
++	const Ops ops = form.single
++	                    ? (form.scalar ? Ops {ZYDIS_MNEMONIC_VMULSS, ZYDIS_MNEMONIC_VADDSS,
++	                                          ZYDIS_MNEMONIC_VSUBSS, ZYDIS_MNEMONIC_INVALID,
++	                                          ZYDIS_MNEMONIC_INVALID, ZYDIS_MNEMONIC_VXORPS,
++	                                          ZYDIS_MNEMONIC_VMOVSS}
++	                                   : Ops {ZYDIS_MNEMONIC_VMULPS, ZYDIS_MNEMONIC_VADDPS,
++	                                          ZYDIS_MNEMONIC_VSUBPS, ZYDIS_MNEMONIC_VADDSUBPS,
++	                                          ZYDIS_MNEMONIC_VBLENDPS, ZYDIS_MNEMONIC_VXORPS,
++	                                          ZYDIS_MNEMONIC_INVALID})
++	                    : (form.scalar ? Ops {ZYDIS_MNEMONIC_VMULSD, ZYDIS_MNEMONIC_VADDSD,
++	                                          ZYDIS_MNEMONIC_VSUBSD, ZYDIS_MNEMONIC_INVALID,
++	                                          ZYDIS_MNEMONIC_INVALID, ZYDIS_MNEMONIC_VXORPD,
++	                                          ZYDIS_MNEMONIC_VMOVSD}
++	                                   : Ops {ZYDIS_MNEMONIC_VMULPD, ZYDIS_MNEMONIC_VADDPD,
++	                                          ZYDIS_MNEMONIC_VSUBPD, ZYDIS_MNEMONIC_VADDSUBPD,
++	                                          ZYDIS_MNEMONIC_VBLENDPD, ZYDIS_MNEMONIC_VXORPD,
++	                                          ZYDIS_MNEMONIC_INVALID});
++	const auto vec = [&](int id) { return RegOp(wide ? YmmReg(id) : XmmReg(id)); };
++	const uint16_t mem_size = wide ? 32 : form.scalar ? (form.single ? 4 : 8) : 16;
++	// Guest operand i: its register, or its memory (only one operand of an FMA can be memory).
++	const auto operand = [&](int i) {
++		return e.ops[i].type == ZYDIS_OPERAND_TYPE_MEMORY ? e.Mem(i, 0, mem_size)
++		                                                   : vec(VectorId(e.ops[i].reg.value));
++	};
++	const int d = VectorId(e.ops[0].reg.value);
++	int a = 0;
++	int b = 0;
++	int c = 0;
++	switch (form.order) {
++		case 132: a = 0, b = 2, c = 1; break;
++		case 213: a = 1, b = 0, c = 2; break;
++		default: a = 1, b = 2, c = 0; break;
++	}
++	// The sign bit of each element that is computed: all elements, or the low one (scalar).
++	Xbyak::Label sign;
++	if (form.negate_product) {
++		Xbyak::Label next;
++		e.g.jmp(next);
++		e.g.align(8);
++		e.g.L(sign);
++		for (int i = 0; i < 4; ++i) {
++			if (form.single) {
++				const uint64_t bit = 0x80000000ULL;
++				e.g.dq(form.scalar ? (i == 0 ? bit : 0) : (bit | bit << 32));
++			} else {
++				e.g.dq(form.scalar && i != 0 ? 0 : 0x8000000000000000ULL);
++			}
++		}
++		e.g.L(next);
++	}
++	const auto negate = [&](int reg) {
++		// x XOR sign is -x exactly (a NaN keeps its payload, with its sign flipped).
++		if (wide) {
++			e.g.vxorps(Xbyak::Ymm(reg), Xbyak::Ymm(reg), ptr[rip + sign]);
++		} else {
++			e.g.vxorps(Xbyak::Xmm(reg), Xbyak::Xmm(reg), ptr[rip + sign]);
++		}
++	};
++	const ZydisMnemonic combine = form.alternate == 1 ? ops.addsub
++	                              : form.subtract     ? ops.sub
++	                                                  : ops.add;
++
++	// The destination is one of the factors (132, 213) and the addend is not the destination
++	// register: d = d * other, then d = d +/- addend, in place, with no scratch register. For a
++	// scalar form, writing d with d as the first source keeps d's other elements.
++	const bool c_is_d = e.ops[c].type == ZYDIS_OPERAND_TYPE_REGISTER &&
++	                    VectorId(e.ops[c].reg.value) == d;
++	if ((a == 0 || b == 0) && !c_is_d && form.alternate != 2) {
++		const int other = a == 0 ? b : a;
++		e.Emit(ops.mul, {vec(d), vec(d), operand(other)});
++		if (form.negate_product) {
++			negate(d);
++		}
++		e.Emit(combine, {vec(d), vec(d), operand(c)});
++		return e.ok;
++	}
++
++	// Otherwise the product goes to a scratch register (saved and restored around this code).
++	const int t1 = e.Scratch();
++	const int t2 = form.alternate == 2 ? e.Scratch() : t1;
++	if (!e.ok) {
++		return false;
++	}
++	const int64_t room = 64;
++	e.Reserve(room);
++	e.SaveVectors({t1, t2});
++	// The factor in a register goes first (the second source of a VEX operation may be memory).
++	const int first  = e.ops[a].type == ZYDIS_OPERAND_TYPE_MEMORY ? b : a;
++	const int second = first == a ? b : a;
++	e.Emit(ops.mul, {vec(t1), operand(first), operand(second)});
++	if (form.negate_product) {
++		negate(t1);
++	}
++	if (form.scalar) {
++		// Result in t1's low element, then into d, keeping d's other elements.
++		e.Emit(combine, {vec(t1), vec(t1), operand(c)});
++		e.Emit(ops.move, {RegOp(XmmReg(d)), RegOp(XmmReg(d)), RegOp(XmmReg(t1))});
++	} else if (form.alternate == 2) {
++		// VFMSUBADD: even elements product + addend, odd elements product - addend.
++		e.Emit(ops.sub, {vec(t2), vec(t1), operand(c)});
++		e.Emit(ops.add, {vec(d), vec(t1), operand(c)});
++		const uint64_t odd = form.single ? (wide ? 0xaa : 0x0a) : (wide ? 0x0a : 0x02);
++		e.Emit(ops.blend, {vec(d), vec(d), vec(t2), ImmOp(odd)});
++	} else {
++		e.Emit(combine, {vec(d), vec(t1), operand(c)});
++	}
++	e.RestoreVectors({t1, t2});
++	e.Release(room);
++	return e.ok;
++}
++
+ bool GenerateFma(Emitter& e) {
+ 	FmaForm form;
+ 	if (!GetFmaForm(e.in.mnemonic, &form) || e.in.operand_count_visible != 3 ||
+@@ -769,6 +896,9 @@ bool GenerateFma(Emitter& e) {
+ 	if (wide && form.scalar) {
+ 		return false;
+ 	}
++	if (FastFma()) {
++		return GenerateFmaFast(e, form, wide);
++	}
+ 	const int d = VectorId(e.ops[0].reg.value);
+ 	// product = a * b, result = product +/- c.
+ 	int a = 0;
+-- 
+2.43.0
+
