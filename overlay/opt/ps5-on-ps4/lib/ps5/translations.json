@@ -3545,6 +3545,15 @@
 "it": "Rete locale per il gioco",
 "pt": "Rede local para o jogo"
 },
+"Simulate PSN sign-in": {
+"ar": "محاكاة تسجيل الدخول إلى PSN",
+"fr": "Simuler la connexion au PSN",
+"tr": "PSN oturum açmayı taklit et",
+"es": "Simular el inicio de sesión en PSN",
+"de": "PSN-Anmeldung simulieren",
+"it": "Simula l'accesso al PSN",
+"pt": "Simular login na PSN"
+},
 "Keep compiled shaders": {
 "ar": "الاحتفاظ بالمظللات المترجمة",
 "fr": "Garder les shaders compilés",
