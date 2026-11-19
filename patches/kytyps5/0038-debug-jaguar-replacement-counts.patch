@@ -1,0 +1,206 @@
+From 795c7997235eefab68ab76abb0b873aaabac1600 Mon Sep 17 00:00:00 2001
+From: hubwallpaper858-tech <hubwallpaper858-tech@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:34:28 -0500
+Subject: [PATCH] loader: KYTY_JAGUAR_COUNT, count how often each Jaguar
+ replacement runs
+
+Debug, for finding what to optimize. With KYTY_JAGUAR_COUNT=1, every
+generated replacement first adds 1 to its own counter, and a thread writes
+the busiest replaced instructions to stdout (so to ~/kytyps5.log in
+EmuFive) every 10 seconds: runs per second by mnemonic and width, and the
+20 busiest guest addresses.
+
+The counting code keeps every guest register, flag and memory byte: RSP
+goes below the red zone, RAX and RCX are pushed there, and the add is a
+LEA. Counters are not atomic (a count can be lost when two threads run the
+same site), and they cost time themselves: use the counts, not the frame
+rate, of such a run. Up to 65536 sites are counted.
+
+tools/jaguar-test passes all 102 forms with it on, exactly as without.
+---
+ src/loader/jaguarCompat.cpp | 135 ++++++++++++++++++++++++++++++++++++
+ src/loader/jaguarCompat.h   |   5 ++
+ 2 files changed, 140 insertions(+)
+
+diff --git a/src/loader/jaguarCompat.cpp b/src/loader/jaguarCompat.cpp
+index 01a62229..5e290956 100644
+--- a/src/loader/jaguarCompat.cpp
++++ b/src/loader/jaguarCompat.cpp
+@@ -6,9 +6,18 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
++#include <chrono>
++#include <cinttypes>
++#include <cstdio>
+ #include <cstdlib>
+ #include <initializer_list>
++#include <map>
++#include <mutex>
++#include <string>
+ #include <string_view>
++#include <thread>
++#include <vector>
+ #include <xbyak/xbyak.h>
+ #include <xbyak/xbyak_util.h>
+ 
+@@ -1396,6 +1405,129 @@ bool Enabled() {
+ 	return enabled;
+ }
+ 
++bool CountEnabled() {
++	static const bool count = [] {
++		const char* value = std::getenv("KYTY_JAGUAR_COUNT");
++		return value != nullptr && *value != 0 && *value != '0';
++	}();
++	return count;
++}
++
++namespace {
++
++// KYTY_JAGUAR_COUNT: one counter per generated replacement. Guest threads increment `runs`
++// without a lock (a count may be lost now and then); the reporter thread only reads it.
++struct CountedSite {
++	uint64_t      runs    = 0;
++	uint64_t      address = 0;
++	ZydisMnemonic mnemonic {};
++	uint16_t      width = 0; // Bits of the widest vector operand (0 for BMI2).
++};
++constexpr size_t           MaxCountedSites = 1 << 16;
++CountedSite                g_sites[MaxCountedSites];
++std::atomic<size_t>        g_site_count {0};
++constexpr int              ReportSeconds = 10;
++
++void ReportCounts() {
++	struct Total {
++		uint64_t      runs = 0;
++		uint64_t      address = 0;
++		ZydisMnemonic mnemonic {};
++		uint16_t      width = 0;
++	};
++	std::vector<uint64_t> last(MaxCountedSites, 0);
++	for (;;) {
++		std::this_thread::sleep_for(std::chrono::seconds(ReportSeconds));
++		const size_t n = std::min(g_site_count.load(std::memory_order_acquire), MaxCountedSites);
++		// A site may have been generated more than once (retries); add them up by address.
++		std::map<std::pair<uint64_t, int>, Total> by_site; // By address and mnemonic.
++		std::map<std::string, uint64_t> by_mnemonic;
++		uint64_t                       all = 0;
++		for (size_t i = 0; i < n; ++i) {
++			const uint64_t runs = __atomic_load_n(&g_sites[i].runs, __ATOMIC_RELAXED);
++			const uint64_t d    = runs - last[i];
++			last[i]             = runs;
++			if (d == 0) {
++				continue;
++			}
++			auto& t    = by_site[{g_sites[i].address, static_cast<int>(g_sites[i].mnemonic)}];
++			t.runs    += d;
++			t.address  = g_sites[i].address;
++			t.mnemonic = g_sites[i].mnemonic;
++			t.width    = g_sites[i].width;
++			std::string name = ZydisMnemonicGetString(g_sites[i].mnemonic);
++			if (g_sites[i].width != 0) {
++				name += g_sites[i].width == 256 ? " ymm" : " xmm";
++			}
++			by_mnemonic[name] += d;
++			all += d;
++		}
++		std::vector<Total> sites;
++		for (const auto& [key, t]: by_site) {
++			sites.push_back(t);
++		}
++		std::sort(sites.begin(), sites.end(), [](const Total& a, const Total& b) { return a.runs > b.runs; });
++		std::vector<std::pair<std::string, uint64_t>> names(by_mnemonic.begin(), by_mnemonic.end());
++		std::sort(names.begin(), names.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
++
++		std::string text = "Jaguar replacements: " + std::to_string(all / ReportSeconds) +
++		                   " runs/s, " + std::to_string(sites.size()) + " busy sites of " +
++		                   std::to_string(n) + "\n  by instruction:";
++		for (size_t i = 0; i < names.size() && i < 15; ++i) {
++			char buf[96];
++			std::snprintf(buf, sizeof buf, "\n    %-22s %12" PRIu64 "/s %5.1f%%", names[i].first.c_str(),
++			              names[i].second / ReportSeconds,
++			              all == 0 ? 0.0 : 100.0 * static_cast<double>(names[i].second) / static_cast<double>(all));
++			text += buf;
++		}
++		text += "\n  by guest address:";
++		for (size_t i = 0; i < sites.size() && i < 20; ++i) {
++			char buf[128];
++			std::snprintf(buf, sizeof buf, "\n    0x%012" PRIx64 " %-18s %4s %12" PRIu64 "/s",
++			              sites[i].address, ZydisMnemonicGetString(sites[i].mnemonic),
++			              sites[i].width == 256 ? "ymm" : sites[i].width == 128 ? "xmm" : "",
++			              sites[i].runs / ReportSeconds);
++			text += buf;
++		}
++		std::fprintf(stdout, "%s\n", text.c_str());
++		std::fflush(stdout);
++	}
++}
++
++// Emits code that adds 1 to a new counter for this instruction. It changes no guest register,
++// flag or memory and keeps the red zone: RSP goes below it, RAX and RCX are saved there, and the
++// add is done with LEA (no flags).
++void EmitCount(const ZydisDecodedInstruction& in, const ZydisDecodedOperand* ops, uint64_t address,
++               Xbyak::CodeGenerator& g) {
++	const size_t index = g_site_count.fetch_add(1, std::memory_order_acq_rel);
++	if (index >= MaxCountedSites) {
++		return;
++	}
++	auto& site    = g_sites[index];
++	site.address  = address;
++	site.mnemonic = in.mnemonic;
++	for (int i = 0; i < in.operand_count_visible; ++i) {
++		if (ops[i].type == ZYDIS_OPERAND_TYPE_REGISTER && IsVector(ops[i].reg.value)) {
++			site.width = std::max<uint16_t>(site.width, IsYmm(ops[i].reg.value) ? 256 : 128);
++		}
++	}
++	static std::once_flag reporter;
++	std::call_once(reporter, [] { std::thread(ReportCounts).detach(); });
++
++	g.lea(rsp, ptr[rsp - static_cast<int>(RedZone)]);
++	g.push(rax);
++	g.push(rcx);
++	g.mov(rcx, reinterpret_cast<uint64_t>(&site.runs));
++	g.mov(rax, ptr[rcx]);
++	g.lea(rax, ptr[rax + 1]);
++	g.mov(ptr[rcx], rax);
++	g.pop(rcx);
++	g.pop(rax);
++	g.lea(rsp, ptr[rsp + static_cast<int>(RedZone)]);
++}
++
++} // namespace
++
+ bool IsMissing(const ZydisDecodedInstruction& instruction) {
+ 	switch (instruction.meta.isa_ext) {
+ 		case ZYDIS_ISA_EXT_AVX2:
+@@ -1411,6 +1543,9 @@ bool Generate(const ZydisDecodedInstruction& instruction, const ZydisDecodedOper
+ 	if (instruction.encoding != ZYDIS_INSTRUCTION_ENCODING_VEX) {
+ 		return false;
+ 	}
++	if (CountEnabled()) {
++		EmitCount(instruction, operands, address, generator);
++	}
+ 	Emitter e(instruction, operands, address, generator);
+ 	if (instruction.meta.isa_ext == ZYDIS_ISA_EXT_BMI2) {
+ 		return GenerateBmi2(e, flags_live);
+diff --git a/src/loader/jaguarCompat.h b/src/loader/jaguarCompat.h
+index 9f16f0d5..f2084407 100644
+--- a/src/loader/jaguarCompat.h
++++ b/src/loader/jaguarCompat.h
+@@ -22,6 +22,11 @@ bool Enabled();
+ // instructions at load time, make them fault, so that every one goes through the run-time path.
+ bool TrapTest();
+ 
++// KYTY_JAGUAR_COUNT=1 (debug): every replacement counts how often it runs, and every 10
++// seconds the busiest instructions (by guest address and by mnemonic) are written to stdout.
++// The counting costs time itself: use it to find what to optimize, not to measure speed.
++bool CountEnabled();
++
+ // Whether the instruction needs AVX2, FMA or BMI2.
+ bool IsMissing(const ZydisDecodedInstruction& instruction);
+ 
+-- 
+2.43.0
+
