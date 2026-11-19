@@ -76,6 +76,22 @@ def wait_watching_memory(child):
         return child.wait(), True
 
 
+def dev_environment():
+    """KYTY_NAME=value lines of ~/.kytyps5/dev-env (scripts/dev-deploy.sh --count writes it)."""
+    env = {}
+    try:
+        with open(os.path.join(store.KYTY_WORK, "dev-env")) as f:
+            for line in f:
+                name, sep, value = line.strip().partition("=")
+                if sep and name.startswith("KYTY_") and name.replace("_", "").isalnum():
+                    env[name] = value
+    except OSError:
+        pass
+    if env:
+        print("ps5-launch: dev-env " + " ".join(f"{k}={v}" for k, v in env.items()), flush=True)
+    return env
+
+
 def kyty_options(settings, games, game, profile):
     args = ["--user-name", user_name(profile["name"]), "--user-id", str(profile["id"]),
             "--console-language", str(settings["console_language"]),
@@ -112,6 +128,10 @@ def main():
         os.environ["KYTY_FPS_COUNTER"] = "1"     # Patch 0005: FPS in the bottom-left corner.
     # Patch 0033: GPU-shared guest memory, on unless turned off in Settings > Games.
     os.environ["KYTY_GPU_SHARED_MEMORY"] = "1" if settings["gpu_shared_memory"] else "0"
+    # The game's settings that are environment variables (Fast math, patch 0037).
+    os.environ.update(games.environment(game.key, settings))
+    # For development: KYTY_* variables from ~/.kytyps5/dev-env, read at every game start.
+    os.environ.update(dev_environment())
     # The PS4 GPU's colour fast clears, depth HiZ and MSAA FMASK leave 8x8-pixel blocks of
     # stale data when a game reads the target back (white dashes in Blue Prince). Mesa's
     # switches turn those shortcuts off.

@@ -3554,6 +3554,15 @@
 "it": "Simula l'accesso al PSN",
 "pt": "Simular login na PSN"
 },
+"Fast math (less exact)": {
+"ar": "حساب سريع (أقل دقة)",
+"fr": "Calcul rapide (moins précis)",
+"tr": "Hızlı hesaplama (daha az hassas)",
+"es": "Cálculo rápido (menos preciso)",
+"de": "Schnelles Rechnen (weniger genau)",
+"it": "Calcolo veloce (meno preciso)",
+"pt": "Cálculo rápido (menos preciso)"
+},
 "Keep compiled shaders": {
 "ar": "الاحتفاظ بالمظللات المترجمة",
 "fr": "Garder les shaders compilés",

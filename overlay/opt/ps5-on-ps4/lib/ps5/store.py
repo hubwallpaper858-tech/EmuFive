@@ -107,7 +107,8 @@ PRESENT_MODES = {"Mailbox": "Balanced (default)", "Fifo": "Smooth (no tearing)",
 
 BACKGROUND_FILE = os.path.join(CONFIG_DIR, "background.png")
 
-# KytyPS5 options a game can have, shown in its Game settings: (key, label, option).
+# KytyPS5 options a game can have, shown in its Game settings: (key, label, option). The option
+# is a list of command-line options, or a dict of environment variables for KytyPS5.
 GAME_OPTIONS = [
     ("perf_overlay", "Performance overlay", ["--perf-overlay"]),
     ("skip_logos", "Skip startup logos", ["--skip-notice-screen"]),
@@ -117,6 +118,9 @@ GAME_OPTIONS = [
     # KytyPS5's PSN simulation: the user is signed in and PSN is reachable (no real connection).
     # Some games quit when they find the console signed out.
     ("psn", "Simulate PSN sign-in", ["--emulate-psn"]),
+    # Patch 0037: FMA instructions as a multiply and an add on the PS4's CPU, much faster than the
+    # exact replacement; results can differ in the last bits.
+    ("fast_fma", "Fast math (less exact)", {"KYTY_JAGUAR_FAST_FMA": "1"}),
 ]
 
 
@@ -341,12 +345,21 @@ class Games:
     def options(self, key, settings=None):
         """The KytyPS5 command-line options for this game: its own, and the defaults for all games
         (Settings, Games) when `settings` is given."""
+        return [arg for option in self._chosen(key, settings) if isinstance(option, list)
+                for arg in option]
+
+    def environment(self, key, settings=None):
+        """The environment variables for KytyPS5 that this game's settings ask for."""
+        env = {}
+        for option in self._chosen(key, settings):
+            if isinstance(option, dict):
+                env.update(option)
+        return env
+
+    def _chosen(self, key, settings):
         entry = self.get(key)
-        args = []
-        for name, _, option in GAME_OPTIONS:
-            if entry.get(name) or (settings is not None and settings.data.get("default_" + name)):
-                args += option
-        return args
+        return [option for name, _, option in GAME_OPTIONS
+                if entry.get(name) or (settings is not None and settings.data.get("default_" + name))]
 
     def add_play_time(self, key, seconds):
         entry = self.get(key)
