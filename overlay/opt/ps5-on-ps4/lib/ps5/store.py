@@ -114,6 +114,9 @@ GAME_OPTIONS = [
     ("shader_cache", "Keep compiled shaders", ["--shader-cache"]),
     ("full_hd", "Render at 1920x1080", ["--screen-width", "1920", "--screen-height", "1080"]),
     ("network", "Local network for the game", ["--network-connected"]),
+    # KytyPS5's PSN simulation: the user is signed in and PSN is reachable (no real connection).
+    # Some games quit when they find the console signed out.
+    ("psn", "Simulate PSN sign-in", ["--emulate-psn"]),
 ]
 
 
