@@ -337,6 +337,10 @@ int main(int argc, char** argv) {
 									break;
 								}
 								case 4: {
+									if (lane == 7) { // No room for a double in the last lane.
+										v = static_cast<uint32_t>(rng() % 70);
+										break;
+									}
 									double d = std::uniform_real_distribution<double>(-100, 100)(rng);
 									memcpy(reg + lane * 4, &d, 8);
 									lane++;
