@@ -127,7 +127,73 @@ static std::string FormOf(const ZydisDecodedInstruction& in, const ZydisDecodedO
 struct Result {
 	long runs = 0, failures = 0, inexact = 0, faults = 0, unsupported = 0, bad_isa = 0;
 	std::string first_failure;
+	// KYTY_JAGUAR_FAST_FMA=1: computed FMA elements that are not bit-exact, by distance in
+	// units in the last place; "special": a NaN or infinity on one side only (the unfused
+	// product overflowed, or inf - inf).
+	long fast_lanes = 0, fast_exact = 0, fast_ulp1 = 0, fast_ulp4 = 0, fast_ulp64 = 0, fast_far = 0,
+	     fast_special = 0;
 };
+
+static const bool g_fast_fma = [] {
+	const char* value = std::getenv("KYTY_JAGUAR_FAST_FMA");
+	return value != nullptr && *value != 0 && *value != '0';
+}();
+
+// Fast FMA: compares destination register `expect` (fused, native) with `got` (replacement).
+// Only the computed elements may differ (all of them, or the low one of a scalar form); returns
+// false when anything else differs.
+static bool FastFmaCompare(const std::string& form, const uint8_t* expect, const uint8_t* got,
+                           Result& r) {
+	const std::string mnemonic = form.substr(0, form.find(' '));
+	const bool        dbl      = mnemonic.back() == 'd';
+	const bool        scalar   = mnemonic.size() >= 2 && mnemonic[mnemonic.size() - 2] == 's';
+	const int         size     = dbl ? 8 : 4;
+	for (int lane = 0; lane < 32 / size; ++lane) {
+		const uint8_t* e = expect + lane * size;
+		const uint8_t* g = got + lane * size;
+		if (memcmp(e, g, size) == 0) {
+			if (lane == 0 || !scalar) {
+				++r.fast_lanes;
+				++r.fast_exact;
+			}
+			continue;
+		}
+		if (scalar && lane != 0) {
+			return false;
+		}
+		++r.fast_lanes;
+		double  ev = 0;
+		double  gv = 0;
+		int64_t eo = 0;
+		int64_t go = 0;
+		if (dbl) {
+			int64_t ei, gi;
+			memcpy(&ei, e, 8), memcpy(&gi, g, 8), memcpy(&ev, e, 8), memcpy(&gv, g, 8);
+			// Ordered so that neighbouring doubles differ by 1 (sign-magnitude to linear).
+			eo = ei < 0 ? INT64_MIN - ei : ei;
+			go = gi < 0 ? INT64_MIN - gi : gi;
+		} else {
+			int32_t ei, gi;
+			float   ef, gf;
+			memcpy(&ei, e, 4), memcpy(&gi, g, 4), memcpy(&ef, e, 4), memcpy(&gf, g, 4);
+			ev = ef, gv = gf;
+			eo = ei < 0 ? int64_t {INT32_MIN} - ei : ei;
+			go = gi < 0 ? int64_t {INT32_MIN} - gi : gi;
+		}
+		if (std::isnan(ev) || std::isnan(gv) || std::isinf(ev) || std::isinf(gv)) {
+			// Both NaN (payload or sign differs) is allowed; NaN or infinity on one side only.
+			if (!(std::isnan(ev) && std::isnan(gv))) {
+				++r.fast_special;
+			} else {
+				++r.fast_exact;
+			}
+			continue;
+		}
+		const uint64_t ulps = eo > go ? static_cast<uint64_t>(eo - go) : static_cast<uint64_t>(go - eo);
+		ulps <= 1 ? ++r.fast_ulp1 : ulps <= 4 ? ++r.fast_ulp4 : ulps <= 64 ? ++r.fast_ulp64 : ++r.fast_far;
+	}
+	return true;
+}
 
 int main(int argc, char** argv) {
 	int per_form = 20;
@@ -460,6 +526,13 @@ int main(int argc, char** argv) {
 							      std::to_string(static_cast<long>(i) - static_cast<long>(AreaSize / 2));
 						}
 						for (int r = 0; r < 16 && why.empty(); ++r) {
+							if (g_fast_fma && fma && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+							    r == ZydisRegisterGetId(ops[0].reg.value)) {
+								if (!FastFmaCompare(form, state0.ymm[r], state1.ymm[r], result)) {
+									why = "ymm" + std::to_string(r) + " differs outside the result";
+								}
+								continue;
+							}
 							if (memcmp(state0.ymm[r], state1.ymm[r], 32) != 0) {
 								// FMA in single precision may differ in the last bit in rare cases.
 								bool close = fma;
@@ -530,5 +603,24 @@ int main(int argc, char** argv) {
 	}
 	printf("\nforms: %zu (%ld pass, %ld fail), instances: %ld, runs: %ld, inexact FMA lanes: %ld\n",
 	       results.size(), forms_ok, forms_bad, total_instances, runs_total, inexact_total);
+	if (g_fast_fma) {
+		// Fast FMA: how far its unfused results are from fused ones, per form and in total.
+		Result t;
+		printf("\nKYTY_JAGUAR_FAST_FMA=1, computed FMA elements vs fused (ulps):\n");
+		printf("%-40s %8s %8s %8s %8s %8s %8s %8s\n", "form", "elements", "exact", "<=1", "<=4",
+		       "<=64", ">64", "special");
+		for (const auto& [form, r]: results) {
+			if (r.fast_lanes == 0) {
+				continue;
+			}
+			printf("%-40s %8ld %8ld %8ld %8ld %8ld %8ld %8ld\n", form.c_str(), r.fast_lanes,
+			       r.fast_exact, r.fast_ulp1, r.fast_ulp4, r.fast_ulp64, r.fast_far, r.fast_special);
+			t.fast_lanes += r.fast_lanes, t.fast_exact += r.fast_exact, t.fast_ulp1 += r.fast_ulp1;
+			t.fast_ulp4 += r.fast_ulp4, t.fast_ulp64 += r.fast_ulp64, t.fast_far += r.fast_far;
+			t.fast_special += r.fast_special;
+		}
+		printf("%-40s %8ld %8ld %8ld %8ld %8ld %8ld %8ld\n", "total", t.fast_lanes, t.fast_exact,
+		       t.fast_ulp1, t.fast_ulp4, t.fast_ulp64, t.fast_far, t.fast_special);
+	}
 	return forms_bad == 0 ? 0 : 1;
 }
